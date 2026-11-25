@@ -8,6 +8,9 @@ Standalone stage 2: scan macOS imports and replace them with JNI-backed stubs.
     python3 jni_stubs.py --inventory macho_inventory.json \
         --out-dir gen/ --bridge-out libs/libroblox_jni_bridge.so
     python3 jni_stubs.py --no-compile --inventory INV.json --out-dir gen/
+    python3 jni_stubs.py --inventory INV.json --out-dir gen/ \
+        --bridge-out libs/bridge.so --include-qt \
+        --stub-libs-dir libs/stubs/
 
 What it does:
 

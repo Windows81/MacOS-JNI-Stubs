@@ -22,3 +22,5 @@ What it does:
 `Bridge.dispatch` currently returns zero. Replace that method body with real
 Android behaviour to turn a stub into a working call. `selftest.py` exercises
 the whole generator and checks the compiled ELF has no `NEEDED` entry.
+
+Licence: GNU General Public License v3 (see `LICENSE`).

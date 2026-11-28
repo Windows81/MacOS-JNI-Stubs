@@ -26,4 +26,31 @@ What it does:
 Android behaviour to turn a stub into a working call. `selftest.py` exercises
 the whole generator and checks the compiled ELF has no `NEEDED` entry.
 
+## Hard requirement: libc++ strings stay native
+
+`std::string` and `std::wstring` must be handled entirely in C inside the
+bridge. No libc++ string operation may cross into Java, and no `std::string`
+instance may depend on a Java object. The only Java-facing library in the port
+is Qt, and Qt works through `QString`.
+
+The native bodies reproduce the macOS libc++ 24-byte layout: long strings keep
+the data pointer at offset 0, the size at offset 8 and the capacity at offset
+`0x10` with the long flag in byte `0x17`; short strings keep their bytes inline
+and store `size << 1` in byte `0x17`. The x8 indirect-result convention is
+captured with a small assembly trampoline where a C function cannot see x8
+before its prologue.
+
+`jni_stubs.py` enforces this with native `SPECIAL_BODIES` entries for every
+`basic_string` import. A new string import must get a native body here before
+the bridge is rebuilt; a generated `bridge_call("...basic_string...")` is a
+build defect.
+
+## Bionic
+
+The claim that the port needs no bionic library at all is a hypothesis, not a
+rule. Studio itself still imports `malloc`, `pthread_*`, file IO, logging and
+JNI entry points. Remove a bionic export only after a native or Qt replacement
+has passed the launch test; do not break the working allocator or libc++ path
+on a guess.
+
 Licence: GNU General Public License v3 (see `LICENSE`).

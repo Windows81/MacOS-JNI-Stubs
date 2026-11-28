@@ -30,7 +30,38 @@ CATEGORY_ID = {"qt": 1, "objc": 2, "syscall": 3, "cpp": 4, "other": 5}
 # would shadow libc and, worse, hand Studio slices of a 1 MiB bump arena;
 # leaving them undefined makes the ELF loader resolve Studio's imports
 # straight to the real heap.
-BIONIC_ALLOCATORS = {"malloc", "free", "calloc", "realloc", "aligned_alloc"}
+BIONIC_ALLOCATORS = {"malloc", "calloc", "realloc", "aligned_alloc"}
+# Filled in from --native-symbols.  A stub for a name that bionic or libc++
+# already exports shadows the working implementation, so those imports are
+# left undefined and the loader binds them to the real library.
+NATIVE_EXPORTED = set()
+# Darwin and Linux disagree on the MAP_ANONYMOUS bit.  These must stay
+# stubbed so the bridge can translate the flags even though bionic exports
+# the same names.
+FORCE_STUBS = {"mmap", "snprintf", "sysconf", "vsnprintf"}
+# Stubs written as assembly because their arguments live on the caller stack.
+ASM_STUBS = {"snprintf"}
+# Android's libc++_shared.so provides the real exception ABI. Our no-op stubs
+# returned from __cxa_throw, which the caller assumes never returns.
+BIONIC_C_FUNCTIONS = {
+    "strnlen", "strcpy", "strncpy", "strcat", "strncat",
+    "strcmp", "strncmp", "strchr", "strrchr", "strstr", "strdup",
+    "strndup", "strcmp", "memset", "memcmp", "memmove", "memcpy",
+    "sprintf", "printf", "fprintf", "puts",
+    "atoi", "atol", "atoll", "strtol", "strtoul", "strtoll", "strtoull",
+    "strtod", "strtof", "isdigit", "isalpha", "isspace", "tolower",
+    "toupper", "pthread_self", "pthread_equal", "pthread_mutex_lock",
+    "pthread_mutex_unlock", "pthread_mutex_init", "pthread_mutex_destroy",
+    "fopen", "fclose", "fgets", "fread", "fwrite", "fprintf", "fputs",
+}
+LIBCXX_PROVIDED = {
+    "__cxa_allocate_exception", "__cxa_bad_cast", "__cxa_bad_typeid",
+    "__cxa_begin_catch", "__cxa_demangle", "__cxa_end_catch",
+    "__cxa_free_exception", "__cxa_get_exception_ptr",
+    "__cxa_get_globals", "__cxa_get_globals_fast", "__cxa_guard_abort",
+    "__cxa_guard_acquire", "__cxa_guard_release", "__cxa_pure_virtual",
+    "__cxa_rethrow", "__cxa_throw", "__cxa_throw_bad_array_new_length",
+}
 
 SPECIAL_BODIES = {
     # bionic has no mi_* symbols, so these thin forwarders are the minimum
@@ -43,6 +74,20 @@ SPECIAL_BODIES = {
         " (unsigned long)a1);",
     "mi_realloc":
         "return (long long)port_reallocate((void *)a0,(unsigned long)a1);",
+    "strlen": "return (long long)port_measure((const char *)a0);",
+    "puts":
+        "char b0[9]; void *handle = dlopen(\"libc.so\", 0); if (handle && !port_real_puts) port_real_puts = (int (*)(const char *)) dlsym(handle, \"puts\"); if (!port_real_puts) return 0; return port_real_puts((const char *)port_fix_arg(a0,b0));",
+    "fputs":
+        "char b0[9]; void *handle = dlopen(\"libc.so\", 0); if (handle && !port_real_fputs) port_real_fputs = (int (*)(const char *,void*)) dlsym(handle, \"fputs\"); if (!port_real_fputs) return 0; return port_real_fputs((const char *)port_fix_arg(a0,b0),(void *)a1);",
+    "printf":
+        "char b0[9],b1[9],b2[9]; void *handle = dlopen(\"libc.so\", 0); if (handle && !port_real_printf) port_real_printf = (int (*)(const char *,...)) dlsym(handle, \"printf\"); if (!port_real_printf) return 0; return port_real_printf((const char *)a0, port_fix_arg(a1,b0), port_fix_arg(a2,b1), port_fix_arg(a3,b2));",
+    "sprintf":
+        "char b0[9],b1[9],b2[9]; void *handle = dlopen(\"libc.so\", 0); if (handle && !port_real_sprintf) port_real_sprintf = (int (*)(char *,const char *,...)) dlsym(handle, \"sprintf\"); if (!port_real_sprintf) return 0; return port_real_sprintf((char *)a0,(const char *)a1, port_fix_arg(a2,b0), port_fix_arg(a3,b1), port_fix_arg(a4,b2));",
+    "vsnprintf":
+        "return (long long)port_darwin_snprintf((char *)a0,"
+        " (unsigned long)a1, (const char *)a2,"
+        " (const unsigned char *)a3);",
+    "free": "port_release((void *)a0); return 0;",
     "mi_free": "port_deallocate((void *)a0); return 0;",
     "mi_get_category": "return (long long)category_name;",
     "__cxa_allocate_exception":
@@ -51,6 +96,8 @@ SPECIAL_BODIES = {
         "__android_log_print(4, \"RobloxPortAlloc\","
         " \"__cxa_throw called (a0=%#llx)\", a0); return 0;",
     "_ZNSt9bad_allocC1Ev": "return a0;",
+    "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm":
+        "return a0;",  # insert returns *this
     "_ZN12QApplicationC2ERiPPci":
         "typedef void (*qt_ctor)(void *, long long, long long, int);"
         " __android_log_print(4, \"RobloxPortQt\","
@@ -97,15 +144,18 @@ SPECIAL_BODIES = {
         " long result = port_syscall(222, a0, a1, a2,"
         "     port_flags, port_fd, a5);"
         " __android_log_print(4, \"RobloxPortNative\","
-        " \"mmap(%#llx,%#llx,%#llx,%#llx->%#lx) -> %#lx\","
-        " a0, a1, a2, a3, port_flags, (unsigned long)result);"
+        " \"mmap(%#llx,%#llx,%#llx,%#llx->%#lx) -> %#lx from %#lx\","
+        " a0, a1, a2, a3, port_flags, (unsigned long)result,"
+        " (unsigned long)__builtin_return_address(0));"
         " return result; }",
     "mprotect":
         "{ long result = port_syscall(226, a0, a1, a2, 0, 0, 0);"
         " __android_log_print(4, \"RobloxPortNative\","
         " \"mprotect(%#llx,%#llx,%#llx) -> %#lx\","
         " a0, a1, a2, (unsigned long)result); return result; }",
-    "sysconf": "return 4096;",
+    "sysconf":
+        "{ if ((int)a0 != 29) return -1;"  # only _SC_PAGESIZE matters
+        " return 16384; }",  # Apple silicon reports 16 KiB pages
     "_tlv_bootstrap": "return port_tlv_bootstrap_wrapped(a0);",
     "pthread_key_create":
         "return port_key_create((unsigned long)a0, (unsigned long)a1);",
@@ -147,10 +197,6 @@ SPECIAL_BODIES = {
         "if (port_mem_native) return (long long)port_native_memchr("
         "(const void *)a0, (int)a1, (unsigned long)a2);"
         " return bridge_call(\"memchr\", 5, a0, a1, a2, a3);",
-    "strlen":
-        "if (port_mem_native) return (long long)port_native_strlen("
-        "(const char *)a0);"
-        " return bridge_call(\"strlen\", 5, a0, a1, a2, a3);",
     "strnlen":
         "if (port_mem_native) return (long long)port_native_strnlen("
         "(const char *)a0, (unsigned long)a1);"
@@ -263,7 +309,16 @@ SPECIAL_BODIES = {
     # internals, so a Java dispatch only loses state.  Inert native bodies
     # are the correct behaviour when bionic owns the heap.
     "mi_free_prepare":
-        "if (port_mi_native) return 0;"
+        "if (port_mi_native) {"
+        "  if (port_ident_count < 20) {"
+        "    port_ident_count++;"
+        "    __android_log_print(4, \"RobloxPortIdent\","
+        "        \"tid=%ld p=%#llx miheap=%#lx pmap=%s\","
+        "        gettid(), a0, (unsigned long)port_mi_dummy_heap,"
+        "        port_map_of((unsigned long)a0));"
+        "  }"
+        "  return 0;"
+        " }"
         " return bridge_call(\"mi_free_prepare\", 3, a0, a1, a2, a3);",
     "mi_free_prepared":
         "if (port_mi_native) return 0;"
@@ -396,6 +451,12 @@ def collect(records, include_qt=False):
                 continue  # real bionic implementations
             if name in BIONIC_ALLOCATORS:
                 continue  # resolve straight to bionic's real heap
+            if name in LIBCXX_PROVIDED:
+                continue  # real exception ABI from libc++_shared.so
+            if name in BIONIC_C_FUNCTIONS:
+                continue  # ordinary C runtime from bionic libc
+            if name in NATIVE_EXPORTED and name not in FORCE_STUBS:
+                continue  # bionic or libc++ already provides this one
             entry = symbols.setdefault(name, {
                 "original": origin, "category": classify_symbol(origin),
                 "origins": set()})
@@ -534,7 +595,14 @@ public final class Bridge {
 
     lines = [
         "/* Generated by jni_stubs.py: macOS symbol -> JNI bridge stubs. */",
-        "#include <jni.h>", "#include <signal.h>", "#include <ucontext.h>", "",
+        "#define _GNU_SOURCE 1",
+        "#include <jni.h>", "#include <string.h>", "#include <signal.h>",
+        "#include <ucontext.h>",
+        "#include <dlfcn.h>", "",
+        "/* One fuzz bit: TRUE = plugin started, FALSE = declined. */",
+        "#ifndef QT_PLUGIN_RESULT",
+        "#define QT_PLUGIN_RESULT JNI_TRUE",
+        "#endif", "",
         "extern void *dlsym(void *handle, const char *symbol);",
         "extern void *dlopen(const char *path, int mode);", "",
         "static const char category_name[] = \"RobloxPort\";",
@@ -556,6 +624,180 @@ public final class Bridge {
         "  long result = syscall(number, p0, p1, p2, p3, p4, p5);",
         "  if (result < 0 && result > -4096) return -1;",
         "  return result;", "}", "",
+        "extern int gettid(void);",
+        "static int (*port_real_snprintf)(char *, unsigned long, const char *, ...);",
+        "static long (*port_real_sysconf)(int);",
+        "static unsigned long port_fix_arg(unsigned long value, char *buffer) {",
+        "  if (value >= 0x10000UL && (value >> 48) != 0UL) {",
+        "    unsigned long long inline_value = value;",
+        "    for (unsigned int index = 0; index < 8; index++)",
+        "      buffer[index] = (char)((inline_value >> (index * 8)) & 0xffU);",
+        "    buffer[8] = 0;",
+        "    __android_log_print(4, \"RobloxPortStr\",",
+        "        \"snprintf arg %#lx inlined\", value);",
+        "    return (unsigned long)buffer;", "  }",
+        "  return value;", "}",
+        "static long long port_snprintf_fixed(long long a0, long long a1,",
+        "                                      long long a2, long long a3,",
+        "                                      long long a4, long long a5) {",
+        "  if (!port_real_snprintf) {",
+        "    void *handle = dlopen(\"libc.so\", 0);",
+        "    if (handle) port_real_snprintf = (void *)dlsym(handle,",
+        "        \"snprintf\");",
+        "  }",
+        "  if (!port_real_snprintf) return 0;",
+        "  char b0[9], b1[9], b2[9];",
+        "  return port_real_snprintf((char *)a0, (unsigned long)a1,",
+        "      (const char *)a2, (void *)port_fix_arg(a3,b0),",
+        "      (void *)port_fix_arg(a4,b1), (void *)port_fix_arg(a5,b2));",
+        "}",
+        "static unsigned long (*port_real_strlen)(const char *) = 0;",
+        "static unsigned long port_measure(const char *address) {",
+        "  unsigned long value = (unsigned long)address;",
+        "  if (value >= 0x10000UL && (value >> 48) != 0UL) {",
+        "    char buffer[9];",
+        "    unsigned long long inline_value = value;",
+        "    for (unsigned int index = 0; index < 8; index++)",
+        "      buffer[index] = (char)((inline_value >> (index * 8)) & 0xffU);",
+        "    buffer[8] = 0;",
+        "    unsigned long length = 0;",
+        "    while (length < 8 && buffer[length] &&",
+        "           buffer[length] >= 0x20 && buffer[length] < 0x7f)",
+        "      length++;",
+        "    __android_log_print(4, \"RobloxPortStr\",",
+        "        \"inline strlen %#lx -> %lu\", value, length);",
+        "    return length;", "  }",
+        "  if (!port_real_strlen) {",
+        "    void *handle = dlopen(\"libc.so\", 0);",
+        "    if (handle)",
+        "      port_real_strlen = (unsigned long (*)(const char *))",
+        "          dlsym(handle, \"strlen\");",
+        "  }",
+        "  return port_real_strlen ? port_real_strlen(address) : 0;", "}",
+        "static void (*port_real_free)(void *) = 0;",
+        "static void port_release(void *address) {",
+        "  unsigned long value = (unsigned long)address;",
+        "  if (value < 0x10000UL || (value >> 48) != 0UL) {",
+        "    __android_log_print(4, \"RobloxPortFree\",",
+        "        \"skip tagged free %#lx\", value);",
+        "    return;", "  }",
+        "  if (!port_real_free) {",
+        "    void *handle = dlopen(\"libc.so\", 0);",
+        "    if (handle)",
+        "      port_real_free = (void (*)(void *))dlsym(handle, \"free\");",
+        "  }",
+        "  if (port_real_free) port_real_free(address);", "}",
+        "long long vlibc_strlen(long long a0, long long a1, long long a2,",
+        "                        long long a3, long long a4, long long a5)",
+        "    __asm__(\"vlibc_strlen\");",
+        "long long vlibc_strlen(long long a0, long long a1, long long a2,",
+        "                        long long a3, long long a4, long long a5) {",
+        "  (void)a1;", "  (void)a2;", "  (void)a3;", "  (void)a4;", "  (void)a5;",
+        "  return (long long)port_measure((const char *)a0);", "}",
+        "long long vlibc_free(long long a0, long long a1, long long a2,",
+        "                      long long a3, long long a4, long long a5)",
+        "    __asm__(\"vlibc_free\");",
+        "long long vlibc_free(long long a0, long long a1, long long a2,",
+        "                      long long a3, long long a4, long long a5) {",
+        "  (void)a1;", "  (void)a2;", "  (void)a3;", "  (void)a4;", "  (void)a5;",
+        "  port_release((void *)a0);", "  return 0;", "}",
+        "static unsigned int port_ident_count = 0;",
+        "static char port_map_buffer[256];",
+        "static unsigned long port_parse_hex(const char *text) {",
+        "  unsigned long value = 0;",
+        "  int digit;",
+        "  while (*text == ' ') text++;",
+        "  while ((digit = (*text >= '0' && *text <= '9') ? *text - '0' :",
+        "      (*text >= 'a' && *text <= 'f') ? *text - 'a' + 10 :",
+        "      (*text >= 'A' && *text <= 'F') ? *text - 'A' + 10 : -1)",
+        "      >= 0) {",
+        "    value = (value << 4) | (unsigned long)digit;",
+        "    text++;", "  }",
+        "  return value;", "}",
+        "static const char *port_map_of(unsigned long address) {",
+        "  FILE *file = fopen(\"/proc/self/maps\", \"r\");",
+        "  int found = 0;",
+        "  if (!file) return \"no-maps\";",
+        "  while (fgets(port_map_buffer, sizeof(port_map_buffer), file)) {",
+        "    const char *dash = port_map_buffer;",
+        "    unsigned long low = port_parse_hex(port_map_buffer);",
+        "    while (*dash && *dash != '-') dash++;",
+        "    unsigned long high = *dash ? port_parse_hex(dash + 1) : 0;",
+        "    if (address >= low && address < high) { found = 1; break; }",
+        "  }",
+        "  fclose(file);",
+        "  if (!found) return \"unmapped\";",
+        "  for (char *cursor = port_map_buffer; *cursor; cursor++)",
+        "    if (*cursor == '\\n') { *cursor = 0; break; }",
+        "  return port_map_buffer;", "}", "",
+        "/* A reservation mapped with no permissions at all (---p) is a",
+        "   placeholder that someone forgot to commit.  Grant read and",
+        "   write on the whole map so the retried instruction can run, and",
+        "   report the map so the producer becomes visible. */",
+        "static int port_grant_map_access(unsigned long address) {",
+        "  FILE *file = fopen(\"/proc/self/maps\", \"r\");",
+        "  char line[512];",
+        "  unsigned long low = 0, high = 0;",
+        "  int placeholder = 0;",
+        "  if (!file) return 0;",
+        "  while (fgets(line, sizeof(line), file)) {",
+        "    char *cursor = line;",
+        "    low = port_parse_hex(cursor);",
+        "    while (*cursor && *cursor != 45) cursor++;",
+        "    high = *cursor ? port_parse_hex(cursor + 1) : 0;",
+        "    if (address >= low && address < high) {",
+        "      while (*cursor && *cursor != 32) cursor++;",
+        "      while (*cursor == 32) cursor++;",
+        "      placeholder = cursor[0] == 45 && cursor[1] == 45 &&",
+        "                    cursor[2] == 45;",
+        "      break;",
+        "    }",
+        "  }",
+        "  fclose(file);",
+        "  if (!placeholder || !low || high <= low) return 0;",
+        "  long result = port_syscall(226, low, high - low, 3, 0, 0, 0);",
+        "  __android_log_print(4, \"RobloxPortDiag\",",
+        "      \"granted read+write %#lx-%#lx for fault at %#lx -> %#lx\",",
+        "      low, high, address, (unsigned long)result);",
+        "  return result == 0;",
+        "}", "",
+        "static int port_text_contains(const char *text, const char *needle) {",
+        "  if (!text || !needle) return 0;",
+        "  unsigned long needle_length = 0;",
+        "  while (needle[needle_length]) needle_length++;",
+        "  for (const char *cursor = text; *cursor; cursor++) {",
+        "    unsigned long index = 0;",
+        "    while (index < needle_length && cursor[index] &&",
+        "           cursor[index] == needle[index]) index++;",
+        "    if (index == needle_length) return 1;",
+        "  }",
+        "  return 0;",
+        "}", "",
+        "/* Walk the frame-pointer chain and log every return address with the",
+        "   mapping that contains it, so a fault can be attributed to a caller",
+        "   rather than only to the frame that touched the bad pointer. */",
+        "static void port_log_stack(unsigned long *regs, unsigned long sp) {",
+        "  unsigned long frame = regs[29];",
+        "  for (int index = 0; index < 20; index++) {",
+        "    if (frame < 0x10000UL) break;",
+        "    if (frame < sp || frame - sp > 0x400000UL) break;",
+        "    if ((frame & 15UL) != 0) break;",
+        "    unsigned long next = *(unsigned long *)frame;",
+        "    unsigned long ret = *(unsigned long *)(frame + 8);",
+        "    __android_log_print(4, \"RobloxPortDiag\",",
+        "        \"frame %d fp %#lx ret %#lx map %s\", index, frame, ret,",
+        "        port_map_of(ret));",
+        "    for (int word = -8; word < 8; word++) {",
+        "      unsigned long slot = frame + (unsigned long)(word * 8);",
+        "      if (slot < sp) continue;",
+        "      __android_log_print(4, \"RobloxPortDiag\",",
+        "          \"  f%d[%+d] %#lx\", index, word,",
+        "          *(unsigned long *)slot);",
+        "    }",
+        "    if (next <= frame) break;",
+        "    frame = next;",
+        "  }",
+        "}", "",
         "/* One build, runtime-selected allocator variants for the fuzz sweep.",
         "   0 = bionic heap, 1 = mmap-backed chunks, 2 = bionic + zeroing. */",
         "static int port_allocator_variant = 0;",
@@ -600,6 +842,25 @@ public final class Bridge {
         "static unsigned int port_proxy_intercepts = 0;",
         "static unsigned long port_proxy_seen_pc[64];",
         "static unsigned int port_proxy_seen_count[64];",
+        "static void port_proxy_noop(void) {}",
+        "static void *port_proxy_vtable[16] = {",
+        "  (void *)port_proxy_noop, (void *)port_proxy_noop,",
+        "  (void *)port_proxy_noop, (void *)port_proxy_noop,",
+        "  (void *)port_proxy_noop, (void *)port_proxy_noop,",
+        "  (void *)port_proxy_noop, (void *)port_proxy_noop,",
+        "  (void *)port_proxy_noop, (void *)port_proxy_noop,",
+        "  (void *)port_proxy_noop, (void *)port_proxy_noop,",
+        "  (void *)port_proxy_noop, (void *)port_proxy_noop,",
+        "  (void *)port_proxy_noop, (void *)port_proxy_noop,",
+        "  (void *)port_proxy_noop, (void *)port_proxy_noop,",
+        "};",
+        "static unsigned char port_proxy_objects[64][256];",
+        "static unsigned int port_proxy_object_next = 0;",
+        "static unsigned long port_proxy_make_object(void) {",
+        "  unsigned int index = port_proxy_object_next++ & 63U;",
+        "  unsigned char *object = port_proxy_objects[index];",
+        "  *(void **)object = port_proxy_vtable;",
+        "  return (unsigned long)object;", "}",
         "typedef struct { unsigned long long word0, word1, word2; }",
         "    port_sret_result;",
         "/* Qt 5 QStringData: ref=-1 (shared null), size=0, offset=24. */",
@@ -1004,7 +1265,7 @@ public final class Bridge {
         "  port_mi_native = miNative ? 1 : 0;",
         "  port_mem_native = memNative ? 1 : 0;",
         "  port_x8_fix = x8Fix ? 1 : 0;",
-        "  port_proxy_fix = (proxyFix < 0 || proxyFix > 2)",
+        "  port_proxy_fix = (proxyFix < 0 || proxyFix > 10)",
         "      ? 0 : (int)proxyFix;",
         "  port_studio_library = tagSkip",
         "      ? \"libRobloxStudioTag_arm64-v8a.so\"",
@@ -1020,16 +1281,398 @@ public final class Bridge {
         "      (int)port_string_native, (int)port_x8_fix,",
         "      (int)port_proxy_fix, tagSkip ? 1 : 0);", "}",
         "",
+        "/* bionic's AArch64 va_list: generic register offsets, floating",
+        "   register offset, stack overflow area, register save area. */",
+        "struct port_va_list {",
+        "  unsigned long gp_offset;",
+        "  unsigned long fp_offset;",
+        "  void *overflow_arg_area;",
+        "  void *reg_save_area;",
+        "};", "",
+        """\
+/* The Darwin formatter calls the resolved bionic function pointer
+   instead of an asm-labelled declaration, so no declaration is needed. */
+
+/* Apple's arm64 ABI puts every anonymous argument on the stack, one
+   8-byte slot each, so a Darwin va_list is a plain byte pointer into that
+   block. bionic's va_list is a struct of register offsets, so a Darwin
+   list handed to bionic's vsnprintf makes the formatter read garbage.
+   Walk the block here and format each conversion with the type that the
+   conversion asks for. */
+static void port_write_number(char *target, unsigned int *at,
+                              unsigned int limit, long value) {
+  char digits[24];
+  unsigned int count = 0;
+  unsigned int index;
+  unsigned long magnitude = value < 0 ? (unsigned long)(-value)
+                                      : (unsigned long)value;
+  if (value < 0 && *at < limit) target[(*at)++] = '-';
+  do {
+    digits[count++] = (char)(48 + (int)(magnitude % 10UL));
+    magnitude /= 10UL;
+  } while (magnitude && count < sizeof(digits));
+  for (index = count; index > 0 && *at < limit; index--)
+    target[(*at)++] = digits[index - 1];
+}
+
+__attribute__((used))
+static int port_format_budget = 400;
+
+__attribute__((used))
+int port_darwin_snprintf(char *destination, unsigned long capacity,
+                         const char *format,
+                         const unsigned char *arguments) {
+  if (port_format_budget > 0) {
+    char short_format[97];
+    unsigned int at = 0;
+    port_format_budget--;
+    while (at < 96 && format && format[at]) {
+      short_format[at] = format[at];
+      at++;
+    }
+    short_format[at] = 0;
+    __android_log_print(4, "RobloxPortFmt",
+        "snprintf cap %lu fmt '%s'", capacity, short_format);
+  }
+  if (!port_real_snprintf) {
+    void *library = dlopen("libc.so", 0);
+    if (library) port_real_snprintf = (void *)dlsym(library, "snprintf");
+  }
+  unsigned long written = 0;
+  const unsigned char *slot = arguments;
+  char spec[40];
+  while (format && *format) {
+    const char *cursor;
+    unsigned int at = 0;
+    unsigned char conversion;
+    int produced = 0;
+    unsigned long room;
+    char *target;
+    if (*format != 37) {
+      if (written + 1 < capacity) destination[written] = *format;
+      written++;
+      format++;
+      continue;
+    }
+    cursor = format + 1;
+    spec[at++] = 37;
+    while (*cursor == 45 || *cursor == 43 || *cursor == 32 ||
+           *cursor == 35 || *cursor == 48 || *cursor == 39) {
+      if (at < 30) spec[at++] = *cursor;
+      cursor++;
+    }
+    if (*cursor == 42) {
+      port_write_number(spec, &at, 34, (long)*(const unsigned long *)slot);
+      slot += 8;
+      cursor++;
+    } else {
+      while (*cursor >= 48 && *cursor <= 57) {
+        if (at < 30) spec[at++] = *cursor;
+        cursor++;
+      }
+    }
+    if (*cursor == 46) {
+      if (at < 30) spec[at++] = '.';
+      cursor++;
+      if (*cursor == 42) {
+        port_write_number(spec, &at, 34,
+                          (long)*(const unsigned long *)slot);
+        slot += 8;
+        cursor++;
+      } else {
+        while (*cursor >= 48 && *cursor <= 57) {
+          if (at < 30) spec[at++] = *cursor;
+          cursor++;
+        }
+      }
+    }
+    while (*cursor == 'h' || *cursor == 'l' || *cursor == 'j' ||
+           *cursor == 'z' || *cursor == 't' || *cursor == 'q' ||
+           *cursor == 'L') cursor++;
+    conversion = (unsigned char)*cursor;
+    if (!conversion) break;
+    if (port_format_budget > 0) {
+      port_format_budget--;
+      __android_log_print(4, "RobloxPortFmt",
+          "conversion %c slot %#lx", (int)conversion,
+          *(const unsigned long *)slot);
+    }
+    room = written < capacity ? capacity - written : 0;
+    target = destination
+        ? destination + (written < capacity ? written : capacity - 1)
+        : 0;
+    switch (conversion) {
+      case '%':
+        spec[at++] = '%'; spec[at] = 0;
+        produced = port_real_snprintf(target, room, spec);
+        break;
+      case 'd': case 'i':
+        spec[at++] = 'l'; spec[at++] = 'l'; spec[at++] = 'd';
+        spec[at] = 0;
+        produced = port_real_snprintf(target, room, spec,
+                                     (long long)*(const long *)slot);
+        slot += 8;
+        break;
+      case 'u': case 'o': case 'x': case 'X':
+        spec[at++] = 'l'; spec[at++] = 'l';
+        spec[at++] = (char)conversion; spec[at] = 0;
+        produced = port_real_snprintf(target, room, spec,
+                        (unsigned long long)*(const unsigned long *)slot);
+        slot += 8;
+        break;
+      case 'c':
+        spec[at++] = 'c'; spec[at] = 0;
+        produced = port_real_snprintf(target, room, spec,
+                                     (int)*(const unsigned long *)slot);
+        slot += 8;
+        break;
+      case 's': {
+        const char *text = (const char *)*(const unsigned long *)slot;
+        slot += 8;
+        if (!text) text = "(null)";
+        spec[at++] = 's'; spec[at] = 0;
+        produced = port_real_snprintf(target, room, spec, text);
+        break;
+      }
+      case 'p': {
+        void *pointer = (void *)*(const unsigned long *)slot;
+        slot += 8;
+        spec[at++] = 'p'; spec[at] = 0;
+        produced = port_real_snprintf(target, room, spec, pointer);
+        break;
+      }
+      case 'f': case 'F': case 'e': case 'E':
+      case 'g': case 'G': case 'a': case 'A': {
+        union { unsigned long bits; double value; } number;
+        number.bits = *(const unsigned long *)slot;
+        slot += 8;
+        spec[at++] = (char)conversion; spec[at] = 0;
+        produced = port_real_snprintf(target, room, spec, number.value);
+        break;
+      }
+      case 'n': {
+        long *counter = (long *)*(const unsigned long *)slot;
+        slot += 8;
+        if (counter) *counter = (long)written;
+        break;
+      }
+      default:
+        if (written + 1 < capacity) destination[written] = 37;
+        written++;
+        if (written + 1 < capacity)
+          destination[written] = (char)conversion;
+        written++;
+        break;
+    }
+    if (produced > 0) written += (unsigned long)produced;
+    format = cursor + 1;
+  }
+  if (destination && capacity) {
+    unsigned long last = written < capacity ? written : capacity - 1;
+    destination[last] = 0;
+  }
+  return (int)written;
+}
+""",
+        "static int (*port_real_vsnprintf_traced)(char *, unsigned long,",
+        "                                          const char *, void *) = 0;",
+        "static int (*port_real_snprintf_varargs)(char *, unsigned long,",
+        "                                         const char *, ...) = 0;",
+        "static int port_traced_vsnprintf(char *destination, unsigned long size,",
+        "                                 const char *format, void *argument) {",
+        "  char format_copy[96];",
+        "  unsigned int index = 0;",
+        "  if (format) {",
+        "    while (index < sizeof(format_copy) - 1 && format[index]) {",
+        "      format_copy[index] = format[index];",
+        "      index++;",
+        "    }",
+        "  }",
+        "  format_copy[index] = 0;",
+        "  __android_log_print(4, \"RobloxPortFmt\",",
+        "      \"vsnprintf fmt=\\\"%s\\\" size %lu arg %#lx\",",
+        "      format_copy, size, (unsigned long)argument);",
+        "  if (argument && (unsigned long)argument > 0x10000UL &&",
+        "      ((unsigned long)argument >> 48) == 0UL) {",
+        "    unsigned long *words = (unsigned long *)argument;",
+        "    __android_log_print(4, \"RobloxPortFmt\",",
+        "        \"  arg words %#lx %#lx %#lx %#lx %#lx %#lx\",",
+        "        words[0], words[1], words[2], words[3], words[4], words[5]);",
+        "    for (unsigned int slot = 0; slot < 4; slot++) {",
+        "      unsigned long candidate = words[slot];",
+        "      if (candidate > 0x10000UL && (candidate >> 48) == 0UL) {",
+        "        char copy[97];",
+        "        unsigned int at = 0;",
+        "        while (at < 96 && ((char *)candidate)[at]) {",
+        "          copy[at] = ((char *)candidate)[at]; at++;",
+        "        }",
+        "        copy[at] = 0;",
+        "        __android_log_print(4, \"RobloxPortFmt\",",
+        "            \"  word[%u] -> \\\"%s\\\"\", slot, copy);",
+        "      }",
+        "    }",
+        "  }",
+        "  /* Studio hands vsnprintf a Darwin-style pointer array in x3;",
+        "     bionic reads x3 as its own va_list. Translate the common",
+        "     all-pointer case into a real variadic call. */",
+        "  if (port_real_snprintf_varargs && argument) {",
+        "    unsigned long *values = (unsigned long *)argument;",
+        "    unsigned int specifiers = 0;",
+        "    for (const char *cursor = format; cursor && *cursor; cursor++)",
+        "      if (cursor[0] == '%' && cursor[1] == 's') specifiers++;",
+        "    if (specifiers == 2 && values[0] > 0x10000UL &&",
+        "        values[1] > 0x10000UL) {",
+        "      __android_log_print(4, \"RobloxPortFmt\",",
+        "          \"  translated 2 pointer varargs\");",
+        "      return port_real_snprintf_varargs(destination, size, format,",
+        "          (char *)values[0], (char *)values[1]);",
+        "    }",
+        "  }",
+        "  return port_real_vsnprintf_traced(destination, size, format, argument);",
+        "}", "",
+        "/* AArch64 has no cacheflush syscall; after rewriting instructions",
+        "   the stale lines must be cleaned and invalidated by hand or the",
+        "   core keeps executing the old stub. */",
+        "static void port_clear_instruction_cache(unsigned long start,",
+        "                                         unsigned long end) {",
+        "  unsigned long address;",
+        "  for (address = start & ~15UL; address < end; address += 16)",
+        "    __asm__ __volatile__(\"dc cvau, %0\" : : \"r\"(address) : \"memory\");",
+        "  __asm__ __volatile__(\"dsb ish\" : : : \"memory\");",
+        "  for (address = start & ~15UL; address < end; address += 16)",
+        "    __asm__ __volatile__(\"ic ivau, %0\" : : \"r\"(address) : \"memory\");",
+        "  __asm__ __volatile__(\"dsb ish\" : : : \"memory\");",
+        "  __asm__ __volatile__(\"isb\" : : : \"memory\");",
+        "}", "",
+        "static void port_write_branch_stub(unsigned long address,",
+        "                                   unsigned long target) {",
+        "  unsigned int instructions[5];",
+        "  instructions[0] = 0xd2800000U | (unsigned int)((target & 0xffffUL) << 5)",
+        "                    | 16U;",
+        "  instructions[1] = 0xf2a00000U |",
+        "                    (unsigned int)(((target >> 16) & 0xffffUL) << 5) | 16U;",
+        "  instructions[2] = 0xf2c00000U |",
+        "                    (unsigned int)(((target >> 32) & 0xffffUL) << 5) | 16U;",
+        "  instructions[3] = 0xf2e00000U |",
+        "                    (unsigned int)(((target >> 48) & 0xffffUL) << 5) | 16U;",
+        "  instructions[4] = 0xd61f0200U; /* br x16 */",
+        "  for (unsigned int index = 0; index < 5; index++)",
+        "    port_patch_word(address + index * 4UL, instructions[index]);",
+        "  port_clear_instruction_cache(address, address + 20);", "}", "",
+        "/* Studio reaches mmap through a three-instruction trampoline that",
+        "   loads a GOT slot.  The GOT slot resolves to bionic, whose flag",
+        "   bits differ from Darwin's, so redirect the trampoline to the",
+        "   bridge's translating entry point before any initializer runs. */",
+        "extern void *port_bridge_mmap(void *, unsigned long, int, int,",
+        "                              int, long long) __asm__(\"mmap\");",
+        "static void port_hook_mmap(unsigned long bias) {",
+        "  unsigned long trampoline = bias + 0x107b8013cUL;",
+        "  port_write_branch_stub(trampoline,",
+        "                         (unsigned long)port_bridge_mmap);",
+        "  __android_log_print(4, \"RobloxPortNative\",",
+        "      \"hooked mmap trampoline %#lx -> %p\", trampoline,",
+        "      (void *)port_bridge_mmap);", "}", "",
+        "static void port_trace_vsnprintf(unsigned long bias) {",
+        "  if (port_real_vsnprintf_traced) return;",
+        "  void *libc = dlopen(\"libc.so\", 0);",
+        "  port_real_vsnprintf_traced =",
+        "      (int (*)(char *, unsigned long, const char *, void *))",
+        "      dlsym(libc, \"vsnprintf\");",
+        "  port_real_snprintf_varargs =",
+        "      (int (*)(char *, unsigned long, const char *, ...))",
+        "      dlsym(libc, \"snprintf\");",
+        "  port_write_branch_stub(bias + 0x107b81e68UL,",
+        "                         (unsigned long)port_traced_vsnprintf);",
+        "  __android_log_print(4, \"RobloxPortFmt\",",
+        "      \"hooked vsnprintf stub %#lx real %p\",",
+        "      bias + 0x107b81e68UL, (void *)port_real_vsnprintf_traced);",
+        "}", "",
+        "/* Resolve the load bias from /proc/self/maps instead of trusting a",
+        "   hardcoded symbol offset: the converter may shift the image by a",
+        "   page, which silently moved every hardcoded address by 0x1000. */",
+        "static unsigned long port_library_bias(const char *path) {",
+        "  FILE *file = fopen(\"/proc/self/maps\", \"r\");",
+        "  if (!file) return 0;",
+        "  char line[512];",
+        "  unsigned long found = 0;",
+        "  while (fgets(line, sizeof(line), file)) {",
+        "    char *cursor = line;",
+        "    unsigned long low = port_parse_hex(cursor);",
+        "    while (*cursor && *cursor != '-') cursor++;",
+        "    if (*cursor) cursor++;",
+        "    while (*cursor && *cursor != ' ') cursor++;",
+        "    while (*cursor == ' ') cursor++;",
+        "    unsigned long file_offset = port_parse_hex(cursor);",
+        "    if (file_offset != 0) continue;",
+        "    if (port_text_contains(cursor, path)) { found = low; break; }",
+        "  }",
+        "  fclose(file);",
+        "  return found ? found - 0x100000000UL : 0;",
+        "}", "",
+        "/* The stripped image imports the C++ exception ABI, which bionic",
+        "   does not export. The Qt bundle ships the real libc++_shared in",
+        "   the same directory as this bridge, so load it globally first. */",
+        "/* Return the absolute path of the first mapped file whose name",
+        "   contains needle, taken from /proc/self/maps. */",
+        "static int port_mapped_path(const char *needle, char *out,",
+        "                            unsigned int capacity) {",
+        "  FILE *file = fopen(\"/proc/self/maps\", \"r\");",
+        "  char line[512];",
+        "  int found = 0;",
+        "  if (!file) return 0;",
+        "  while (fgets(line, sizeof(line), file)) {",
+        "    char *hit = strstr(line, needle);",
+        "    if (!hit || hit == line || hit[-1] != '/') continue;",
+        "    while (hit > line && hit[-1] != 32 && hit[-1] != 9) hit--;",
+        "    unsigned int length = 0;",
+        "    while (hit[length] && hit[length] != 10 && length + 1 < capacity)",
+        "      { out[length] = hit[length]; length++; }",
+        "    out[length] = 0;",
+        "    found = 1;",
+        "    break;",
+        "  }",
+        "  fclose(file);",
+        "  return found;",
+        "}", "",
+        "/* The stripped image imports the C++ exception ABI, which bionic",
+        "   does not export. The Qt bundle ships the real libc++_shared, so",
+        "   load it globally before Studio. */",
+        "static void port_preload_libcxx(void) {",
+        "  char candidate[512];",
+        "  void *preloaded = 0;",
+        "  if (!port_mapped_path(\"libc++_shared.so\", candidate,",
+        "                        (unsigned int)sizeof(candidate))) {",
+        "    __android_log_print(4, \"RobloxPortStep\",",
+        "        \"preload libc++: not mapped\");",
+        "    return;",
+        "  }",
+        "  preloaded = dlopen(candidate, 2);",
+        "  __android_log_print(4, \"RobloxPortStep\",",
+        "      \"preload libc++ %s -> %p\", candidate, preloaded);",
+        "}", "",
+
+
         "JNIEXPORT jlong JNICALL",
         "Java_io_github_robloxport_MainActivity_resetAndInit(JNIEnv *env,",
         "                                                     jobject thiz) {",
         "  (void)env;", "  (void)thiz;",
+        "  port_preload_libcxx();",
         "  void *handle = dlopen(port_studio_library, 1);",
-        "  if (!handle) return -1;",
+        "  if (!handle) {",
+        '    const char *load_error = dlerror();'
+        '    __android_log_print(6, "RobloxPortStep", "reset: dlopen failed %s",'
+        '        load_error ? load_error : "(no error recorded)");'
+        "    return -1;",
+        "  }",
         "  void *onload = dlsym(handle, \"JNI_OnLoad\");",
         "  if (!onload) return -2;",
-        "  unsigned long bias = (unsigned long)onload - 0x10e3b8000UL;",
+        "  unsigned long bias = port_library_bias(port_studio_library);",
+        "  if (!bias) bias = (unsigned long)onload - 0x10e3b9000UL;",
+        "  __android_log_print(4, \"RobloxPortStep\",",
+        "      \"reset: bias from maps %#lx (onload %p)\", bias, onload);",
         "  port_studio_bias = bias;",
+        "  port_trace_vsnprintf(bias);",
+        "  port_hook_mmap(bias);",
         "  __android_log_print(4, \"RobloxPortStep\", \"reset: dlopen %p"
         " onload %p bias %#lx\", handle, onload, bias);",
         "  unsigned int *guard = (unsigned int *)(bias + 0x10c2b088cUL);",
@@ -1045,13 +1688,23 @@ public final class Bridge {
         "  }",
         "  *guard = 0;",
         "  *slot = singleton;",
-        "  typedef unsigned long (*init_fn)(void);",
-        "  init_fn init = (init_fn)(bias + 0x1026f7158UL);",
-        "  __android_log_print(4, \"RobloxPortStep\","
+        "  /* proxyFix 7 is the experiment where Studio's own main is",
+        "     allowed to initialise everything; the hand-built call into",
+        "     the call-once block reads its arguments off the stack and",
+        "     only works when another Studio frame set that stack up. */",
+        "  unsigned long init_result = 0;",
+        "  if (port_proxy_fix != 7) {",
+        "    typedef unsigned long (*init_fn)(void);",
+        "    init_fn init = (init_fn)(bias + 0x1026f7158UL);",
+        "    __android_log_print(4, \"RobloxPortStep\","
         " \"reset: calling owning init %#lx\", (unsigned long)init);",
-        "  unsigned long init_result = init();",
-        "  __android_log_print(4, \"RobloxPortStep\","
+        "    init_result = init();",
+        "    __android_log_print(4, \"RobloxPortStep\","
         " \"reset: owning init returned %#lx\", init_result);",
+        "  } else {",
+        "    __android_log_print(4, \"RobloxPortStep\",",
+        "        \"reset: skipping manual init\");",
+        "  }",
         "  return (jlong)init_result;", "}", "",
         "JNIEXPORT jint JNICALL",
         "Java_io_github_robloxport_MainActivity_launchStudio(JNIEnv *env,",
@@ -1118,6 +1771,10 @@ public final class Bridge {
         "  /* dlopen/dlsym are not signal-safe and hid earlier faults.  Use",
         "     the bias recorded when resetAndInit linked the library. */",
         "  unsigned long studio_base = port_studio_bias;",
+        "  /* dlopen runs the image's initialisers before resetAndInit has",
+        "     recorded the bias, so resolve it here or every address below",
+        "     is off by the whole load base. */",
+        "  if (!studio_base) studio_base = port_library_bias(port_studio_library);",
         "  unsigned long fault_pc = (unsigned long)context->uc_mcontext.pc;",
         "  __android_log_print(4, \"RobloxPortDiag\",",
         "      \"fault sig %d addr %#lx pc_va %#lx lr_va %#lx base %#lx\",",
@@ -1125,24 +1782,191 @@ public final class Bridge {
         "      0x100000000UL + fault_pc - studio_base,",
         "      0x100000000UL + regs[30] - studio_base, studio_base);",
         "  __android_log_print(4, \"RobloxPortDiag\",",
+        "      \"fault map %s\", port_map_of(fault_pc));",
+        "  __android_log_print(4, \"RobloxPortDiag\",",
+        "      \"fault lr map %s\", port_map_of(regs[30]));",
+        "  __android_log_print(4, \"RobloxPortDiag\",",
+        "      \"fault addr map [%s]\", port_map_of((unsigned long)info->si_addr));",
+        "  if (port_proxy_fix == 8 && (signal_number == 11 ||",
+        "      signal_number == 7) &&",
+        "      port_grant_map_access((unsigned long)info->si_addr))",
+        "    return;",
+        "  if (studio_base) {",
+        "    unsigned int *stub = (unsigned int *)",
+        "        (studio_base + 0x107b81e68UL);",
+        "    __android_log_print(4, \"RobloxPortDiag\",",
+        "        \"stub words %#x %#x %#x %#x %#x\",",
+        "        stub[0], stub[1], stub[2], stub[3], stub[4]);",
+        "  }",        "  port_log_stack((unsigned long *)regs,",
+        "                 (unsigned long)context->uc_mcontext.sp);",
+        "  __android_log_print(4, \"RobloxPortDiag\",",
+        "      \"fault insn %#x at pc %#lx\",",
+        "      *(unsigned int *)fault_pc, fault_pc);",
+        "  __android_log_print(4, \"RobloxPortDiag\",",
         "      \"x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx\",",
         "      regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]);",
+        "  { unsigned long *held = (unsigned long *)regs[0];",
+        "    if (regs[0] > 0x1000UL && (regs[0] >> 48) == 0UL &&",
+        "        port_map_of(regs[0])[0])",
+        "      __android_log_print(4, \"RobloxPortDiag\",",
+        "          \"x0 words %#lx %#lx %#lx %#lx %#lx %#lx\",",
+        "          held[0], held[1], held[2], held[3], held[4], held[5]);",
+        "  }",
         "  __android_log_print(4, \"RobloxPortDiag\",",
         "      \"x8=%#llx x9=%#llx x16=%#llx x17=%#llx x19=%#lx x20=%#llx\",",
         "      regs[8], regs[9], regs[16], regs[17], object, regs[20]);",
         "  __android_log_print(4, \"RobloxPortDiag\",",
         "      \"x21=%#llx x22=%#llx x23=%#llx x24=%#llx x25=%#llx x26=%#llx\",",
         "      regs[21], regs[22], regs[23], regs[24], regs[25], regs[26]);",
-        "  if (object >= 0x1000UL) {",
+        "  if (object >= 0x1000UL && (object >> 48) == 0UL) {",
         "    unsigned char *bytes = (unsigned char *)object;",
         "    for (unsigned int offset = 0; offset < 0x60; offset += 8) {",
         "      unsigned long word = *(unsigned long *)(bytes + offset);",
         "      __android_log_print(4, \"RobloxPortDiag\",",
         "          \"x19+%#02x = %#lx\", offset, word);", "    }", "  }",
+        "  if (regs[0] >= 0x1000UL && (regs[0] >> 48) == 0UL) {",
+        "    unsigned char *argument = (unsigned char *)regs[0];",
+        "    for (unsigned int offset = 0; offset < 0x40; offset += 8) {",
+        "      unsigned long word = *(unsigned long *)(argument + offset);",
+        "      __android_log_print(4, \"RobloxPortDiag\",",
+        "          \"x0+%#02x = %#lx\", offset, word);", "    }", "  }",
+        # A wrongly rebased static value appears at runtime as bias + k,
+        # where k is a small original payload.  Undo the rebase generically
+        # instead of patching each consumer site.
+        "  if (port_proxy_fix == 3 && port_studio_bias &&",
+        "      (signal_number == 11 || signal_number == 7)) {",
+        "    for (unsigned int index = 0; index < 30; index++) {",
+        "      unsigned long value = (unsigned long)regs[index];",
+        "      if (value > port_studio_bias &&",
+        "          value - port_studio_bias < 0x10000UL) {",
+        "        unsigned long corrected = value - port_studio_bias;",
+        "        regs[index] = corrected;",
+        "        __android_log_print(4, \"RobloxPortProxy\",",
+        "            \"unrebase x%u %#lx -> %#lx at pc %#lx\",",
+        "            index, value, corrected, fault_pc);",
+        "        return;", "      }", "    }", "  }",
+        # A thrown exception object whose first field is a small tagged
+        # value makes the real __cxa_throw dereference garbage.  The typeinfo
+        # passed as the second argument is valid; use it for that field.
+        "  if (port_proxy_fix == 4 && signal_number == 11 &&",
+        "      regs[0] >= 0x1000UL && regs[1] >= 0x1000UL &&",
+        "      *(unsigned long *)regs[0] < 0x10000UL) {",
+        "    unsigned long old_value = *(unsigned long *)regs[0];",
+        "    *(unsigned long *)regs[0] = regs[1];",
+        "    for (unsigned int index = 0; index < 30; index++)",
+        "      if ((unsigned long)regs[index] == old_value)",
+        "        regs[index] = regs[1];",
+        "    __android_log_print(4, \"RobloxPortProxy\",",
+        "        \"repaired exception field %#lx -> %#lx\",",
+        "        old_value, regs[1]);",
+        "    return;", "  }",
         # General interception: if the fault address and the decoded base
         # register are both small, the converted image dereferenced a
         # tagged value as a pointer.  Redirect the base register to a
         # zeroed proxy page and resume instead of patching one site.
+        "  if (port_proxy_fix == 5 &&",
+        "      (signal_number == 11 || signal_number == 7) &&",
+        "      port_proxy_intercepts < 512) {",
+        "    unsigned int instruction = *(unsigned int *)fault_pc;",
+        "    unsigned int base = (instruction >> 5) & 0x1fU;",
+        "    unsigned long old_value = (unsigned long)regs[base];",
+        "    if (old_value < 0x10000UL || (old_value >> 48) != 0UL) {",
+        "      unsigned long object = port_proxy_make_object();",
+        "      regs[base] = object;",
+        "      for (unsigned int index = 0; index < 30; index++)",
+        "        if (index != base && (unsigned long)regs[index] == old_value)",
+        "          regs[index] = object;",
+        "      port_proxy_intercepts++;",
+        "      __android_log_print(4, \"RobloxPortProxy\",",
+        "          \"typed proxy x%u %#lx -> %#lx\",",
+        "          base, old_value, object);",
+        "      return;", "    }", "  }",
+        "  if (port_proxy_fix == 6 &&",
+        "      (signal_number == 11 || signal_number == 7) &&",
+        "      port_proxy_intercepts < 512) {",
+        "    unsigned int instruction = *(unsigned int *)fault_pc;",
+        "    unsigned int base = (instruction >> 5) & 0x1fU;",
+        "    unsigned long old_value = (unsigned long)regs[base];",
+        "    if (old_value < 0x10000UL || (old_value >> 48) != 0UL) {",
+        "      unsigned long object = port_proxy_make_object();",
+        "      regs[base] = object;",
+        "      port_proxy_intercepts++;",
+        "      __android_log_print(4, \"RobloxPortProxy\",",
+        "          \"stack proxy x%u %#lx -> %#lx\",",
+        "          base, old_value, object);",
+        "      return;", "    }", "  }",
+        "  if (port_proxy_fix == 7 &&",
+        "      (signal_number == 11 || signal_number == 7) &&",
+        "      port_proxy_intercepts < 512) {",
+        "    unsigned int instruction = *(unsigned int *)fault_pc;",
+        "    unsigned int base = (instruction >> 5) & 0x1fU;",
+        "    unsigned long old_value = (unsigned long)regs[base];",
+        "    if (old_value < 0x10000UL || (old_value >> 48) != 0UL) {",
+        "      unsigned int slot = (unsigned int)(old_value & 63UL);",
+        "      unsigned char *object = port_proxy_objects[slot];",
+        "      *(void **)object = port_proxy_vtable;",
+        "      regs[base] = (unsigned long)object;",
+        "      for (unsigned int index = 0; index < 30; index++)",
+        "        if (index != base && (unsigned long)regs[index] == old_value)",
+        "          regs[index] = (unsigned long)object;",
+        "      port_proxy_intercepts++;",
+        "      __android_log_print(4, \"RobloxPortProxy\",",
+        "          \"stable proxy x%u %#lx -> %#lx slot %u\",",
+        "          base, old_value, (unsigned long)object, slot);",
+        "      return;", "    }", "  }",
+        "  if (port_proxy_fix == 8 &&",
+        "      (signal_number == 11 || signal_number == 7) &&",
+        "      port_proxy_intercepts < 512) {",
+        "    unsigned int instruction = *(unsigned int *)fault_pc;",
+        "    unsigned int base = (instruction >> 5) & 0x1fU;",
+        "    unsigned long old_value = (unsigned long)regs[base];",
+        "    if (old_value < 0x10000UL || (old_value >> 48) != 0UL) {",
+        "      unsigned int slot = (unsigned int)(old_value & 63UL);",
+        "      unsigned char *object = port_proxy_objects[slot];",
+        "      *(void **)object = port_proxy_vtable;",
+        "      regs[base] = (unsigned long)object;",
+        "      port_proxy_intercepts++;",
+        "      __android_log_print(4, \"RobloxPortProxy\",",
+        "          \"stack patch x%u %#lx\",",
+        "          base, old_value);",
+        "      unsigned long *stack = (unsigned long *)context->uc_mcontext.sp;",
+        "      for (unsigned int index = 0; index < 256; index++)",
+        "        if (stack[index] == old_value)",
+        "          stack[index] = (unsigned long)object;",
+        "      return;", "    }", "  }",
+        "  if (port_proxy_fix == 9 &&",
+        "      (signal_number == 11 || signal_number == 7) &&",
+        "      port_proxy_intercepts < 512) {",
+        "    unsigned int instruction = *(unsigned int *)fault_pc;",
+        "    unsigned int base = (instruction >> 5) & 0x1fU;",
+        "    unsigned long old_value = (unsigned long)regs[base];",
+        "    if (old_value < 0x10000UL || (old_value >> 48) != 0UL) {",
+        "      void *chunk = malloc(256);",
+        "      regs[base] = (unsigned long)chunk;",
+        "      for (unsigned int index = 0; index < 30; index++)",
+        "        if (index != base && (unsigned long)regs[index] == old_value)",
+        "          regs[index] = (unsigned long)chunk;",
+        "      port_proxy_intercepts++;",
+        "      __android_log_print(4, \"RobloxPortProxy\",",
+        "          \"heap proxy x%u %#lx -> %p\",",
+        "          base, old_value, chunk);",
+        "      return;", "    }", "  }",
+        "  if (port_proxy_fix == 10 &&",
+        "      (signal_number == 11 || signal_number == 7)) {",
+        "    unsigned long function = (unsigned long)info->si_addr;",
+        "    /* If the fault is inside bionic, skip the offending call by",
+        "       returning to its caller. */",
+        "    const char *map = port_map_of((unsigned long)fault_pc);",
+        "    if (map && port_text_contains(map, \"/bionic/libc.so\")) {",
+        "      __android_log_print(4, \"RobloxPortProxy\",",
+        "          \"skip libc call at pc %#lx lr %#lx\", fault_pc,",
+        "          (unsigned long)regs[30]);",
+        "      context->uc_mcontext.pc = regs[30];",
+        "      return;", "    }", "  }",
+        "  __android_log_print(4, \"RobloxPortProxy\",",
+        "      \"handler sig %d fix %d pages %p addr %#lx\",",
+        "      signal_number, port_proxy_fix, port_proxy_pages,",
+        "      (unsigned long)info->si_addr);",
         "  if (port_proxy_fix && port_proxy_pages &&",
         "      (signal_number == 11 || signal_number == 7) &&",
         "      port_proxy_intercepts < 512) {",
@@ -1195,14 +2019,217 @@ public final class Bridge {
         "  port_syscall(94, 0, 0, 0, 0, 0, 0); /* exit_group */", "}", "",
         "static JavaVM *g_vm;", "static jclass g_bridge;",
         "static jmethodID g_dispatch;", "",
+        "static jboolean port_qt_n_0(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "  return 0;", "}", "",
+        "static jboolean port_qt_n_1(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "  return 0;", "}", "",
+        "static void port_qt_n_2(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_3(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_4(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_5(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static jboolean port_qt_n_6(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "  return 0;", "}", "",
+        "static void port_qt_n_7(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_8(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_9(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_10(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_11(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_12(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_13(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_14(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_15(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_16(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static jobject port_qt_n_17(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "  return 0;", "}", "",
+        "static void port_qt_n_18(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static jboolean port_qt_n_19(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "  return 0;", "}", "",
+        "static void port_qt_n_20(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_21(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_22(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static jboolean port_qt_n_23(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "  return 0;", "}", "",
+        "static void port_qt_n_24(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static jboolean port_qt_n_25(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "  return 0;", "}", "",
+        "static void port_qt_n_26(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_27(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_28(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_29(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_30(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_31(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_32(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_33(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static jboolean port_qt_n_34(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "  return QT_PLUGIN_RESULT;", "}", "",
+        "static void port_qt_n_35(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_36(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_37(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_38(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_39(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_40(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_41(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_42(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static jboolean port_qt_n_43(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "  return 0;", "}", "",
+        "static void port_qt_n_44(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
+        "static void port_qt_n_45(JNIEnv *env, jobject thiz) {",
+        "  (void)env;", "  (void)thiz;",
+        "}", "",
         "jint JNI_OnLoad(JavaVM *vm, void *reserved) {",
         "  (void)reserved;", "  g_vm = vm;",
+        "  __android_log_print(4, \"RobloxPortQt\","
+        "      \"BRIDGE_V3 JNI_OnLoad entered\");"
         "  if (port_proxy_fix && !port_proxy_pages)",
         "    port_proxy_pages = (unsigned char *)calloc(1, 1 << 20);",
         "  port_install_fault_handlers();",
         "  JNIEnv *env = 0;",
         "  if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK)",
         "    return JNI_VERSION_1_6;",
+        "  jclass qt_native = (*env)->FindClass(env,"
+        "      \"org/qtproject/qt5/android/QtNative\");"
+        "  if (qt_native) {"
+        "    static JNINativeMethod methods[] = {"
+        "      {(char *)\"dispatchGenericMotionEvent\", (char *)\"(Landroid/view/MotionEvent;)Z\", (void *)port_qt_n_0},"
+        "      {(char *)\"dispatchKeyEvent\", (char *)\"(Landroid/view/KeyEvent;)Z\", (void *)port_qt_n_1},"
+        "      {(char *)\"fillContextMenu\", (char *)\"(Landroid/view/Menu;)V\", (void *)port_qt_n_2},"
+        "      {(char *)\"handleLocationChanged\", (char *)\"(III)V\", (void *)port_qt_n_3},"
+        "      {(char *)\"handleOrientationChanged\", (char *)\"(II)V\", (void *)port_qt_n_4},"
+        "      {(char *)\"handleRefreshRateChanged\", (char *)\"(F)V\", (void *)port_qt_n_5},"
+        "      {(char *)\"isTabletEventSupported\", (char *)\"()Z\", (void *)port_qt_n_6},"
+        "      {(char *)\"keyDown\", (char *)\"(IIIZ)V\", (void *)port_qt_n_7},"
+        "      {(char *)\"keyUp\", (char *)\"(IIIZ)V\", (void *)port_qt_n_8},"
+        "      {(char *)\"keyboardGeometryChanged\", (char *)\"(IIII)V\", (void *)port_qt_n_9},"
+        "      {(char *)\"keyboardVisibilityChanged\", (char *)\"(Z)V\", (void *)port_qt_n_10},"
+        "      {(char *)\"longPress\", (char *)\"(III)V\", (void *)port_qt_n_11},"
+        "      {(char *)\"mouseDown\", (char *)\"(III)V\", (void *)port_qt_n_12},"
+        "      {(char *)\"mouseMove\", (char *)\"(III)V\", (void *)port_qt_n_13},"
+        "      {(char *)\"mouseUp\", (char *)\"(III)V\", (void *)port_qt_n_14},"
+        "      {(char *)\"mouseWheel\", (char *)\"(IIIFF)V\", (void *)port_qt_n_15},"
+        "      {(char *)\"onActivityResult\", (char *)\"(IILandroid/content/Intent;)V\", (void *)port_qt_n_16},"
+        "      {(char *)\"onBind\", (char *)\"(Landroid/content/Intent;)Landroid/os/IBinder;\", (void *)port_qt_n_17},"
+        "      {(char *)\"onClipboardDataChanged\", (char *)\"()V\", (void *)port_qt_n_18},"
+        "      {(char *)\"onContextItemSelected\", (char *)\"(IZ)Z\", (void *)port_qt_n_19},"
+        "      {(char *)\"onContextMenuClosed\", (char *)\"(Landroid/view/Menu;)V\", (void *)port_qt_n_20},"
+        "      {(char *)\"onCreateContextMenu\", (char *)\"(Landroid/view/ContextMenu;)V\", (void *)port_qt_n_21},"
+        "      {(char *)\"onNewIntent\", (char *)\"(Landroid/content/Intent;)V\", (void *)port_qt_n_22},"
+        "      {(char *)\"onOptionsItemSelected\", (char *)\"(IZ)Z\", (void *)port_qt_n_23},"
+        "      {(char *)\"onOptionsMenuClosed\", (char *)\"(Landroid/view/Menu;)V\", (void *)port_qt_n_24},"
+        "      {(char *)\"onPrepareOptionsMenu\", (char *)\"(Landroid/view/Menu;)Z\", (void *)port_qt_n_25},"
+        "      {(char *)\"quitQtAndroidPlugin\", (char *)\"()V\", (void *)port_qt_n_26},"
+        "      {(char *)\"quitQtCoreApplication\", (char *)\"()V\", (void *)port_qt_n_27},"
+        "      {(char *)\"runPendingCppRunnables\", (char *)\"()V\", (void *)port_qt_n_28},"
+        "      {(char *)\"sendRequestPermissionsResult\", (char *)\"(I[Ljava/lang/String;[I)V\", (void *)port_qt_n_29},"
+        "      {(char *)\"setDisplayMetrics\", (char *)\"(IIIIDDDDF)V\", (void *)port_qt_n_30},"
+        "      {(char *)\"setNativeActivity\", (char *)\"(Landroid/app/Activity;)V\", (void *)port_qt_n_31},"
+        "      {(char *)\"setNativeService\", (char *)\"(Landroid/app/Service;)V\", (void *)port_qt_n_32},"
+        "      {(char *)\"setSurface\", (char *)\"(ILjava/lang/Object;II)V\", (void *)port_qt_n_33},"
+        "      {(char *)\"startQtAndroidPlugin\", (char *)\"(Ljava/lang/String;Ljava/lang/String;)Z\", (void *)port_qt_n_34},"
+        "      {(char *)\"startQtApplication\", (char *)\"()V\", (void *)port_qt_n_35},"
+        "      {(char *)\"tabletEvent\", (char *)\"(IIJIIIFFF)V\", (void *)port_qt_n_36},"
+        "      {(char *)\"terminateQt\", (char *)\"()V\", (void *)port_qt_n_37},"
+        "      {(char *)\"touchAdd\", (char *)\"(IIIZIIFFFF)V\", (void *)port_qt_n_38},"
+        "      {(char *)\"touchBegin\", (char *)\"(I)V\", (void *)port_qt_n_39},"
+        "      {(char *)\"touchCancel\", (char *)\"(I)V\", (void *)port_qt_n_40},"
+        "      {(char *)\"touchEnd\", (char *)\"(II)V\", (void *)port_qt_n_41},"
+        "      {(char *)\"updateApplicationState\", (char *)\"(I)V\", (void *)port_qt_n_42},"
+        "      {(char *)\"updateNativeActivity\", (char *)\"()Z\", (void *)port_qt_n_43},"
+        "      {(char *)\"updateWindow\", (char *)\"()V\", (void *)port_qt_n_44},"
+        "      {(char *)\"waitForServiceSetup\", (char *)\"()V\", (void *)port_qt_n_45},"
+        "    };"
+        "    __android_log_print(4, \"RobloxPortQt\","
+        "        \"qt method0 %p method34 %p\","
+        "        (void *)methods[0].fnPtr,"
+        "        (void *)methods[34].fnPtr);"
+        "    int registered = (*env)->RegisterNatives(env, qt_native,"
+        "        methods, 46);"
+        "    __android_log_print(4, \"RobloxPortQt\","
+        "        \"register QtNative -> %d\", registered);"
+        "  } else {"
+        "    __android_log_print(4, \"RobloxPortQt\","
+        "        \"register QtNative -> class not found\");"
+        "  }", "",
         "  { /* Qt registers its Java natives from JNI_OnLoad; repeat it now",
         "       that the app class loader is fully available. */",
         "    void *core = dlopen(\"libQt5Core_arm64-v8a.so\", 0);",
@@ -1240,12 +2267,29 @@ public final class Bridge {
         "      return 0;", "  }",
         "  jstring jname = (*env)->NewStringUTF(env, name);",
         "  if (!jname) return 0;",
-        "  return (long long)(*env)->CallStaticLongMethod(env, g_bridge,",
-        "      g_dispatch, jname, (jint)cat, (jlong)a0, (jlong)a1,",
-        "      (jlong)a2, (jlong)a3);", "}", "",
+        "  long long result = (long long)(*env)->CallStaticLongMethod(",
+        "      env, g_bridge, g_dispatch, jname, (jint)cat, (jlong)a0,",
+        "      (jlong)a1, (jlong)a2, (jlong)a3);",
+        "  if (((unsigned long long)result >> 48) != 0UL)",
+        "    __android_log_print(4, \"RobloxPortTag\",",
+        "        \"tagged return from %s = %#llx\", name, result);",
+        "  return result;", "}", "",
+    ]
+    # Darwin arm64 passes every variadic argument on the stack, so the
+    # formatter needs the caller's stack pointer at entry.  A C function
+    # cannot read it before its own prologue runs, so snprintf is a small
+    # assembly thunk instead of a generated C stub.
+    lines += [
+        '__asm__(".globl snprintf\\n"',
+        '        ".type snprintf, %function\\n"',
+        '        "snprintf:\\n"',
+        '        "  mov x3, sp\\n"',
+        '        "  b port_darwin_snprintf\\n");', '',
     ]
     for idx, row in enumerate(rows, 1):
         elf, cat = row[1], CATEGORY_ID.get(row[2], 5)
+        if elf in ASM_STUBS:
+            continue
         if elf in SRET_BODIES:
             lines += [
                 "port_sret_result stub_%d(long long a0, long long a1," % idx,
@@ -1318,11 +2362,22 @@ def main():
                     help="also emit stubs for Qt symbols (needed for dlopen)")
     ap.add_argument("--stub-libs-dir",
                     help="emit empty .so files for macOS dylibs named by DT_NEEDED")
+    ap.add_argument("--native-symbols",
+                    help="file of names bionic/libc++ already export; those "
+                         "imports are left for the loader to bind")
     args = ap.parse_args()
     if not args.inventory and not args.macho:
         ap.error("provide --inventory or --macho")
     if not args.no_compile and not args.bridge_out:
         ap.error("--bridge-out is required unless --no-compile is given")
+    if args.native_symbols:
+        with open(args.native_symbols) as handle:
+            for line in handle:
+                name = line.strip()
+                if name:
+                    NATIVE_EXPORTED.add(name)
+        print("jni_stubs: %d native names from %s"
+              % (len(NATIVE_EXPORTED), args.native_symbols))
     records = load_records(args)
     symbols = collect(records, args.include_qt)
     rows, c_path = emit(symbols, args.out_dir)

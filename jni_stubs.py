@@ -75,6 +75,12 @@ SPECIAL_BODIES = {
     "mi_realloc":
         "return (long long)port_reallocate((void *)a0,(unsigned long)a1);",
     "strlen": "return (long long)port_measure((const char *)a0);",
+    "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6resizeEmc":
+        "return (long long)port_native_string_resize((unsigned long)a0,"
+        " (unsigned long)a1, (int)a2);",
+    "_ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE6resizeEmw":
+        "return (long long)port_native_string_resize((unsigned long)a0,"
+        " (unsigned long)a1 * 4, (int)a2);",
     "puts":
         "char b0[9]; void *handle = dlopen(\"libc.so\", 0); if (handle && !port_real_puts) port_real_puts = (int (*)(const char *)) dlsym(handle, \"puts\"); if (!port_real_puts) return 0; return port_real_puts((const char *)port_fix_arg(a0,b0));",
     "fputs":
@@ -1099,6 +1105,40 @@ public final class Bridge {
         "                             unsigned long count) {",
         "  for (unsigned long index = 0; index < count; index++)",
         "    destination[index] = source[index];", "}",
+        # libc++ basic_string::resize is imported from libMacOS, so the
+        # generic stub left the object short.  Studio then passed the
+        # object's inline stack buffer to vsnprintf with a 43-byte
+        # capacity, which wrote over its own saved x19 slot.  Keep the
+        # macOS 32-byte layout: long data at +0, size at +8, capacity
+        # at +0x10, long flag at +0x17, short size at +0x18.
+        "static unsigned long port_native_string_resize(",
+        "    unsigned long object_address, unsigned long new_size,",
+        "    int fill_character) {",
+        "  if (!object_address || new_size > 0x100000UL) return 0;",
+        "  unsigned char *header = (unsigned char *)object_address;",
+        "  int is_long = (header[0x17] & 0x80) != 0;",
+        "  unsigned long old_size = is_long",
+        "      ? *(unsigned long *)(object_address + 8)",
+        "      : *(unsigned long *)(object_address + 0x18);",
+        "  const unsigned char *old_data = is_long",
+        "      ? *(const unsigned char **)object_address",
+        "      : (const unsigned char *)(object_address + 8);",
+        "  unsigned long capacity = (new_size + 16UL) & ~15UL;",
+        "  unsigned char *buffer = (unsigned char *)port_allocate(capacity);",
+        "  if (!buffer) return object_address;",
+        "  unsigned long kept = old_size < new_size ? old_size : new_size;",
+        "  if (kept && old_data >= buffer && old_data < buffer + capacity)",
+        "    kept = 0;",
+        "  for (unsigned long index = 0; index < kept; index++)",
+        "    buffer[index] = old_data[index];",
+        "  for (unsigned long index = kept; index < new_size; index++)",
+        "    buffer[index] = (unsigned char)fill_character;",
+        "  buffer[new_size] = 0;",
+        "  *(unsigned long *)object_address = (unsigned long)buffer;",
+        "  *(unsigned long *)(object_address + 8) = new_size;",
+        "  *(unsigned long *)(object_address + 0x10) = capacity;",
+        "  header[0x17] = 0x80;",
+        "  return object_address;", "}",
         "static void port_native_move(void *destination_pointer,",
         "                             const void *source_pointer,",
         "                             unsigned long count) {",
@@ -1414,7 +1454,7 @@ int port_darwin_snprintf(char *destination, unsigned long capacity,
     }
     room = written < capacity ? capacity - written : 0;
     target = destination
-        ? destination + (written < capacity ? written : capacity - 1)
+        ? destination + (written < capacity ? written : 0)
         : 0;
     switch (conversion) {
       case '%':

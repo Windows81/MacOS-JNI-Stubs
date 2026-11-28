@@ -170,9 +170,6 @@ SPECIAL_BODIES = {
     "mi_get_category": "return (long long)category_name;",
     "__cxa_allocate_exception":
         "return (long long)port_allocate((unsigned long)a0);",
-    "__cxa_throw":
-        "__android_log_print(4, \"RobloxPortAlloc\","
-        " \"__cxa_throw called (a0=%#llx)\", a0); return 0;",
     "_ZNSt9bad_allocC1Ev": "return a0;",
     "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6insertEmPKcm":
         "return a0;",  # insert returns *this
@@ -512,14 +509,12 @@ def collect(records, include_qt=False):
                 continue
             if name in ("dlopen", "dlsym", "dlclose", "dlerror"):
                 continue  # real bionic implementations
+            if name == "__cxa_throw":
+                continue  # hand-written tracer above owns this symbol
             if name in BIONIC_ALLOCATORS:
                 continue  # resolve straight to bionic's real heap
-            if name in LIBCXX_PROVIDED:
-                continue  # real exception ABI from libc++_shared.so
             if name in BIONIC_C_FUNCTIONS:
                 continue  # ordinary C runtime from bionic libc
-            if name in NATIVE_EXPORTED and name not in FORCE_STUBS:
-                continue  # bionic or libc++ already provides this one
             entry = symbols.setdefault(name, {
                 "original": origin, "category": classify_symbol(origin),
                 "origins": set()})
@@ -2528,6 +2523,25 @@ int port_darwin_snprintf(char *destination, unsigned long capacity,
         "      signal_number == 7) &&",
         "      port_grant_map_access((unsigned long)info->si_addr))",
         "    return;",
+        "  if (port_proxy_fix == 22 && studio_base && signal_number == 11) {",
+        "    unsigned long site = fault_pc - studio_base;",
+        "    if (site == 0x100048cd4UL || site == 0x100048cb4UL ||",
+        "        site == 0x100048cd0UL || site == 0x100048c98UL) {",
+        "      unsigned long source = (unsigned long)regs[1] &",
+        "          0x00ffffffffffffffUL;",
+        "      __android_log_print(4, \"RobloxPortProxy\",",
+        "          \"tagfault site=%#lx x8=%#lx x0=%#lx x1=%#lx\",",
+        "          site, (unsigned long)regs[8], (unsigned long)regs[0],",
+        "          (unsigned long)regs[1]);",
+        "      if (source > 0x1000UL) {",
+        "        unsigned long *words = (unsigned long *)source;",
+        "        for (int word = 0; word < 8; word++)",
+        "          __android_log_print(4, \"RobloxPortProxy\",",
+        "              \"  s%d %#lx\", word, words[word]);",
+        "      }",
+        "      return;",
+        "    }",
+        "  }",
         "  if (port_proxy_fix == 19 && studio_base && signal_number == 11) {",
         "    unsigned long site = fault_pc - studio_base;",
         "    if (site == 0x10000ca54UL || site == 0x10000ca80UL ||",
@@ -3391,6 +3405,9 @@ def main():
         "_ZNSt3__18numpunctIcEC2Em",
         "_ZNSt3__18numpunctIcED2Ev",
     })
+    CXX_FORWARD.update(name for name in LIBCXX_PROVIDED
+                       if name not in SPECIAL_BODIES and
+                       name != "__cxa_throw")
     print("jni_stubs: %d libc++ forwarding stubs" % len(CXX_FORWARD))
     records = load_records(args)
     symbols = collect(records, args.include_qt)
